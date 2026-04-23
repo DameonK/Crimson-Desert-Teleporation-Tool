@@ -1,0 +1,57 @@
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+**/build/
+**/*.spec
+
+# Bundled Python dependencies (rebuilt by build_exe.bat)
+**/pylibs/
+
+# Per-version release artifacts live on GitHub Releases, not in the repo.
+**/dist/
+v*/*.zip
+v*/Crimson Desert Teleporter Tool*/
+
+# Root-level stray artifacts (not part of the repo)
+/build/
+/dist/
+/pylibs/
+/cd_teleporter.py
+/cd_teleporter_map.py
+/aob_scan_report.json
+/Crimson Desert Teleporter Tool v1.0.1/
+/Crimson Desert Teleporter Tool v1.0.1.zip
+/nexus_description.txt
+/worldmap.jpg
+/Screenshots/
+/Teleporter.code-workspace
+/CrimsonDesertTeleporter.spec
+/run_teleporter.bat
+/build_exe.bat
+
+# Stray files inside version folders (recovery logs, POI dumps, draft posts,
+# map images that bundled exes embed internally, etc.) — keep only the
+# per-version source, batch files, icon, release zip, and shipped exe.
+v*/*.txt
+v*/*.json
+v*/*.jpg
+v*/*.jpeg
+v*/*.png
+v*/*.gif
+v*/*.log
+v*/*.md
+v*/**/*.txt
+v*/**/*.json
+v*/**/*.jpg
+v*/**/*.jpeg
+v*/**/*.png
+v*/**/*.gif
+v*/**/*.log
+v*/**/*.md
+
+# IDE / editor
+.vscode/
+.idea/
