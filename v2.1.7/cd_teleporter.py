@@ -25,6 +25,7 @@ import sys
 import json
 import time
 import atexit
+import threading
 import tkinter as tk
 from collections import Counter
 from tkinter import ttk
@@ -321,6 +322,30 @@ MEM_RESERVE = 0x2000
 MEM_RELEASE = 0x8000
 PAGE_EXECUTE_READWRITE = 0x40
 
+# Used by the dynamic player-entity scan fallback (when AOB_ENTITY misses).
+PAGE_READABLE_MASK = 0x66  # READONLY|READWRITE|EXECUTE_READ|EXECUTE_READWRITE
+PAGE_GUARD     = 0x100
+PAGE_NOACCESS  = 0x01
+
+
+class _MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress",       ctypes.c_void_p),
+        ("AllocationBase",    ctypes.c_void_p),
+        ("AllocationProtect", ctypes.wintypes.DWORD),
+        ("RegionSize",        ctypes.c_size_t),
+        ("State",             ctypes.wintypes.DWORD),
+        ("Protect",           ctypes.wintypes.DWORD),
+        ("Type",              ctypes.wintypes.DWORD),
+    ]
+
+
+k32.VirtualQueryEx.argtypes = [
+    ctypes.wintypes.HANDLE, ctypes.c_void_p,
+    ctypes.POINTER(_MEMORY_BASIC_INFORMATION), ctypes.c_size_t,
+]
+k32.VirtualQueryEx.restype = ctypes.c_size_t
+
 
 # ── TeleportEngine ───────────────────────────────────────────────────
 
@@ -383,6 +408,7 @@ class TeleportEngine:
         self.world_offset_addr = 0
         self._trampolines = []  # far-mode trampoline allocations to free
         self._far_mode = False  # True if block is far from hooks
+        self._invuln_thread = None  # poll-restore loop when hook_c missing
 
     # ── attach / detach ──────────────────────────────────────────────
 
@@ -429,11 +455,17 @@ class TeleportEngine:
     def scan_and_hook(self):
         data, base = self._read_module()
 
-        # Entity hook: AOB + 3
+        # Entity hook: AOB + 3. Failure is non-fatal in 2026-05+ game builds
+        # where this code path was refactored away — we fall back to a
+        # Python-side memory scan to locate the player entity (see
+        # _find_player_entity_dynamic below).
         idx = data.find(self.AOB_ENTITY)
         if idx == -1:
-            raise RuntimeError("Entity hook AOB not found — game version mismatch?")
-        self.hook_a = base + idx + 3
+            self.hook_a = 0
+            print("[teleporter] AOB_ENTITY not found — will use dynamic entity scan.",
+                  flush=True)
+        else:
+            self.hook_a = base + idx + 3
 
         # Position block
         idx = data.find(self.AOB_POS)
@@ -441,11 +473,16 @@ class TeleportEngine:
             raise RuntimeError("Position block AOB not found")
         self.hook_b = base + idx
 
-        # Health hook
+        # Health hook. Non-fatal: when missing, the 10s invulnerability
+        # feature is silently disabled (set_invuln becomes a no-op against
+        # an uninstalled cave) but everything else works.
         idx = data.find(self.AOB_HEALTH)
         if idx == -1:
-            raise RuntimeError("Health hook AOB not found")
-        self.hook_c = base + idx
+            self.hook_c = 0
+            print("[teleporter] AOB_HEALTH not found — invulnerability disabled.",
+                  flush=True)
+        else:
+            self.hook_c = base + idx
 
         # Map destination — hook at AOB+4 (the vmovsd store, after the load)
         idx = data.find(self.AOB_MAP)
@@ -473,6 +510,150 @@ class TeleportEngine:
         # Allocate & install
         self._alloc_block()
         self._install_hooks()
+
+        # If the entity hook was missing, locate the player entity via a
+        # Python-side scan and seed teleportData+0x18 so get_entity_base()
+        # returns it. Without this, teleport_to_abs would have no entity ptr.
+        if not self.hook_a and self.td:
+            ent = self._find_player_entity_dynamic()
+            if ent:
+                try:
+                    self.pm.write_bytes(self.td + 0x18, struct.pack("<Q", ent),
+                                        8)
+                    print(f"[teleporter] Player entity located dynamically: "
+                          f"0x{ent:X}", flush=True)
+                except Exception:
+                    pass
+            else:
+                print("[teleporter] Dynamic entity scan found no candidate. "
+                      "Move around in-game and use the 'Refind Player' option "
+                      "(or restart attach) to retry.", flush=True)
+
+    # ── dynamic player-entity scan (AOB_ENTITY fallback) ─────────────
+
+    def _iter_committed_regions(self):
+        """Yield (base, size) for every committed, readable, non-guarded
+        memory region of the attached process."""
+        handle = self.pm.process_handle
+        addr = 0
+        mbi = _MEMORY_BASIC_INFORMATION()
+        while True:
+            ret = k32.VirtualQueryEx(handle, ctypes.c_void_p(addr),
+                                     ctypes.byref(mbi), ctypes.sizeof(mbi))
+            if not ret:
+                return
+            base = mbi.BaseAddress or 0
+            size = mbi.RegionSize
+            if (mbi.State == MEM_COMMIT
+                    and (mbi.Protect & PAGE_READABLE_MASK)
+                    and not (mbi.Protect & PAGE_GUARD)
+                    and not (mbi.Protect & PAGE_NOACCESS)):
+                yield base, size
+            addr = base + size
+            if addr >= (1 << 47):
+                return
+
+    def _is_player_entity_valid(self, ent_addr):
+        """Cheap validity check: vtable still in module + position floats
+        still in sensible range. Used to detect stale entity ptrs."""
+        if not ent_addr:
+            return False
+        try:
+            raw = self.pm.read_bytes(ent_addr, 8)
+            vptr = struct.unpack("<Q", raw)[0]
+        except Exception:
+            return False
+        module_base = self.module.lpBaseOfDll
+        module_end  = module_base + self.module.SizeOfImage
+        if not (module_base <= vptr < module_end):
+            return False
+        try:
+            raw = self.pm.read_bytes(ent_addr + 0x90, 12)
+            fx, fy, fz = struct.unpack("<fff", raw)
+        except Exception:
+            return False
+        return all(-200000.0 <= v <= 200000.0 for v in (fx, fy, fz)) \
+            and not (fx == 0.0 and fy == 0.0 and fz == 0.0)
+
+    def _find_player_entity_dynamic(self,
+                                    max_candidates=300,
+                                    poll_duration_s=1.0,
+                                    poll_interval_s=0.05):
+        """Heap-scan for entity-like structures (vtable into module, sane
+        position floats at +0x90), then poll their position fields briefly
+        and return the entity that moved the most (i.e. the player). If
+        nothing moved, returns the first candidate as a best-effort guess."""
+        module_base = self.module.lpBaseOfDll
+        module_end  = module_base + self.module.SizeOfImage
+
+        candidates = []
+        seen = set()
+        # Phase A: scan committed heap regions for entity signatures.
+        for base, size in self._iter_committed_regions():
+            if module_base <= base < module_end:
+                continue   # skip the executable itself
+            if size > 64 * 1024 * 1024:
+                continue   # skip huge regions (image cache, etc.)
+            try:
+                data = self.pm.read_bytes(base, size)
+            except Exception:
+                continue
+            n = len(data)
+            if n < (0x90 + 12):
+                continue
+            for off in range(0, n - (0x90 + 12), 16):
+                vptr = struct.unpack_from("<Q", data, off)[0]
+                if not (module_base <= vptr < module_end):
+                    continue
+                try:
+                    fx, fy, fz = struct.unpack_from("<fff", data, off + 0x90)
+                except struct.error:
+                    continue
+                if not (-200000.0 <= fx <= 200000.0
+                        and -200000.0 <= fy <= 200000.0
+                        and -200000.0 <= fz <= 200000.0):
+                    continue
+                if fx == 0.0 and fy == 0.0 and fz == 0.0:
+                    continue
+                ent = base + off
+                if ent in seen:
+                    continue
+                seen.add(ent)
+                candidates.append(ent)
+                if len(candidates) >= max_candidates:
+                    break
+            if len(candidates) >= max_candidates:
+                break
+
+        if not candidates:
+            return 0
+
+        # Phase B: poll position fields, pick the one that changed most.
+        prev = {}
+        for ent in candidates:
+            try:
+                prev[ent] = self.pm.read_bytes(ent + 0x90, 12)
+            except Exception:
+                prev[ent] = None
+        change_count = {ent: 0 for ent in candidates}
+        end_t = time.time() + poll_duration_s
+        while time.time() < end_t:
+            time.sleep(poll_interval_s)
+            for ent in candidates:
+                try:
+                    cur = self.pm.read_bytes(ent + 0x90, 12)
+                except Exception:
+                    continue
+                if prev[ent] is None or cur != prev[ent]:
+                    change_count[ent] += 1
+                prev[ent] = cur
+
+        best_ent, best_changes = max(change_count.items(), key=lambda kv: kv[1])
+        if best_changes == 0:
+            # Nothing moved during the poll. Fall back to the first candidate
+            # as a best-effort guess — refind will retry if/when it moves.
+            return candidates[0]
+        return best_ent
 
     # ── memory allocation ────────────────────────────────────────────
 
@@ -653,12 +834,15 @@ class TeleportEngine:
 
         # Save original bytes and install JMP patches. Each hook replaces a
         # different instruction length in 2.1.6+ (entity/map are now VEX-encoded).
+        # Hooks whose AOB failed (addr == 0) are silently skipped — see
+        # scan_and_hook for which ones degrade gracefully.
         hooks = [
             (self.hook_a, self.block + self.OFF_CA, self.HOOK_A_LEN),
             (self.hook_b, self.block + self.OFF_CB, self.HOOK_B_LEN),
             (self.hook_c, self.block + self.OFF_CC, self.HOOK_C_LEN),
             (self.hook_d, self.block + self.OFF_CD, self.HOOK_D_LEN),
         ]
+        hooks = [h for h in hooks if h[0]]
 
         if not self._far_mode:
             # Near mode: direct rel32 jumps from hook -> cave
@@ -715,9 +899,21 @@ class TeleportEngine:
         if not self.td:
             return 0
         try:
-            return self.pm.read_ulonglong(self.td + 0x18)
+            ent = self.pm.read_ulonglong(self.td + 0x18)
         except Exception:
             return 0
+        # When running without the entity hook (AOB_ENTITY missed), the
+        # cached pointer can go stale — game reallocates the player entity
+        # on zone/character changes. Validate and re-scan on the spot.
+        if not self.hook_a and not self._is_player_entity_valid(ent):
+            ent = self._find_player_entity_dynamic(poll_duration_s=0.5)
+            if ent:
+                try:
+                    self.pm.write_bytes(self.td + 0x18,
+                                        struct.pack("<Q", ent), 8)
+                except Exception:
+                    pass
+        return ent
 
     def get_world_offsets(self):
         """Return (ox, oy, oz, ow) or None."""
@@ -784,6 +980,70 @@ class TeleportEngine:
                 self.pm.write_bytes(self.inv, b'\x01' if on else b'\x00', 1)
             except Exception:
                 pass
+        # When the HEALTH hook is missing (AOB_HEALTH refactored in 2026-05+
+        # builds), the cave_c bypass can't intercept damage before it lands.
+        # Fall back to a poll-based restore loop that watches the player
+        # entity at ~100 Hz and undoes any 4-byte int decrease into a
+        # plausible HP range. Crude but enough to survive teleport landing
+        # damage (single discrete hits applied 16–33 ms apart in-game).
+        # Side effect: cooldown timers in the entity freeze during the
+        # 10s window — an acceptable cost for not dying from a bad landing.
+        if on and not self.hook_c and self.get_entity_base():
+            if not (self._invuln_thread and self._invuln_thread.is_alive()):
+                self._invuln_thread = threading.Thread(
+                    target=self._invuln_restore_loop, daemon=True)
+                self._invuln_thread.start()
+
+    def _invuln_restore_loop(self):
+        """Poll-based fallback for the broken HEALTH hook. Snapshots a
+        window of player-entity memory, then repeatedly compares each
+        4-byte int against the snapshot. Any field that decreased into
+        the HP-plausible range gets restored; fields that increased
+        legitimately (regen ticks) become the new baseline. Loop exits
+        when the in-memory invuln flag goes back to 0."""
+        ent = self.get_entity_base()
+        if not ent or not self.inv:
+            return
+        try:
+            snap = bytearray(self.pm.read_bytes(ent, 0x1000))
+        except Exception:
+            return
+        # Heuristic bounds chosen to filter out pointers, packed bit-flags,
+        # and timer ticks while still covering plausible HP / shield /
+        # stamina values seen in Crimson Desert (low-thousands typical).
+        HP_MIN, HP_MAX = 1, 1_000_000
+        MAX_DELTA = 500_000   # ignore huge swings (probably not HP)
+        while True:
+            # Stop when UI flips invuln back off.
+            try:
+                if self.pm.read_bytes(self.inv, 1) == b'\x00':
+                    return
+            except Exception:
+                return
+            try:
+                cur = self.pm.read_bytes(ent, len(snap))
+            except Exception:
+                return
+            for off in range(0, len(cur) - 4, 4):
+                old = struct.unpack_from("<i", snap, off)[0]
+                new = struct.unpack_from("<i", cur, off)[0]
+                if not (HP_MIN <= old <= HP_MAX):
+                    # Old wasn't HP-shaped — adopt current as baseline.
+                    struct.pack_into("<i", snap, off, new)
+                    continue
+                if new < old and (old - new) <= MAX_DELTA \
+                        and HP_MIN <= new:
+                    # Looks like damage. Restore.
+                    try:
+                        self.pm.write_bytes(ent + off,
+                                            bytes(snap[off:off + 4]), 4)
+                    except Exception:
+                        pass
+                elif new > old:
+                    # Regen / heal — adopt the higher value as new baseline.
+                    struct.pack_into("<i", snap, off, new)
+                # else: unchanged, do nothing.
+            time.sleep(0.01)
 
 
 # ── WaypointStore ────────────────────────────────────────────────────
@@ -2392,6 +2652,16 @@ class TeleporterApp(tk.Tk):
         ttk.Label(status_bar, text=f"v{VERSION}",
                   style='Dim.TLabel', font=('Segoe UI', 8)).pack(
             side=tk.RIGHT, padx=12)
+        # Fallback-mode indicator: visible only when the current game build
+        # broke one or more AOBs and the teleporter is running on its
+        # runtime fallbacks (dynamic entity scan, poll-based invuln).
+        # Populated in _auto_attach after scan_and_hook completes.
+        self.fallback_var = tk.StringVar(value="")
+        self._fallback_lbl = ttk.Label(status_bar,
+                                       textvariable=self.fallback_var,
+                                       style='Dim.TLabel',
+                                       font=('Segoe UI', 8))
+        # Don't pack yet — only shown when fallback_var becomes non-empty.
 
     # ── Hotkey management ────────────────────────────────────────────
 
@@ -2828,6 +3098,21 @@ class TeleporterApp(tk.Tk):
         else:
             self._retry_btn.pack_forget()
 
+    def _refresh_fallback_indicator(self):
+        """Show the dim status-bar tag describing which (if any) AOBs
+        broke and which runtime fallback is in use. Empty string hides it."""
+        parts = []
+        if not getattr(self.engine, "hook_a", 0):
+            parts.append("entity: dynamic scan")
+        if not getattr(self.engine, "hook_c", 0):
+            parts.append("invuln: poll-restore")
+        if parts:
+            self.fallback_var.set("Fallback mode — " + ", ".join(parts))
+            self._fallback_lbl.pack(side=tk.RIGHT, padx=12)
+        else:
+            self.fallback_var.set("")
+            self._fallback_lbl.pack_forget()
+
     def _is_game_running(self):
         """Check if the attached game process is still alive."""
         try:
@@ -2873,6 +3158,7 @@ class TeleporterApp(tk.Tk):
             self._set_status("Connected", self.OK_CLR)
             self.bottom_var.set(
                 "Hooks installed. Move around in-game to capture entity.")
+            self._refresh_fallback_indicator()
         except pymem.exception.ProcessNotFound:
             self._set_status("Waiting for game...", self.ERR_CLR)
             self.after(3000, self._auto_attach)
@@ -2892,6 +3178,7 @@ class TeleporterApp(tk.Tk):
         self.engine = TeleportEngine()
         self._set_status("Retrying...", self.WARN_CLR)
         self.bottom_var.set("Retrying connection...")
+        self._refresh_fallback_indicator()
         self.update()
         self.after(500, self._auto_attach)
 
